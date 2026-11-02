@@ -1,0 +1,997 @@
+name: Build Android APK (Fallback Worker)
+
+on:
+  workflow_dispatch:
+    inputs:
+      jobId:
+        description: 'Job ID from Bot'
+        required: true
+      userId:
+        description: 'User ID'
+        required: true
+      payload:
+        description: 'Build Payload (JSON)'
+        required: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Prepare Project
+        env:
+          PAYLOAD: ${{ github.event.inputs.payload }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Payload bisa berisi 2 bentuk source:
+          # - "url"         -> mode "URL ke APK", link ZIP publik biasa
+          # - "zipAssetUrl" -> mode "ZIP Project", asset GitHub Release
+          #                    (perlu header auth, bukan wget biasa)
+          # Payload dibaca lewat env (bukan di-interpolasi ke shell) supaya aman
+          # dari tanda kutip / karakter khusus di nama app.
+          URL=$(echo "$PAYLOAD" | jq -r '.url')
+          ZIP_ASSET_URL=$(echo "$PAYLOAD" | jq -r '.zipAssetUrl')
+          BUILD_TYPE=$(echo "$PAYLOAD" | jq -r '.buildType // "release"')
+          echo "BUILD_TYPE=$BUILD_TYPE" >> "$GITHUB_ENV"
+
+          if [ "$URL" != "null" ] && [ -n "$URL" ]; then
+            wget -O project.zip "$URL"
+          elif [ "$ZIP_ASSET_URL" != "null" ] && [ -n "$ZIP_ASSET_URL" ]; then
+            curl -L \
+              -H "Authorization: token $GH_TOKEN" \
+              -H "Accept: application/octet-stream" \
+              -o project.zip \
+              "$ZIP_ASSET_URL"
+          else
+            echo "Tidak ada source project (url maupun zipAssetUrl) di payload." >&2
+            exit 1
+          fi
+
+          unzip -q project.zip -d project
+
+      - name: Cari root project Android
+        id: findroot
+        run: |
+          # 1) gradlew paling dangkal (maks 5 level)
+          GRADLEW=$(find project -maxdepth 5 -type f -name gradlew \
+            -not -path '*/__MACOSX/*' -not -path '*/.*/*' \
+            | awk '{print length($0)" "$0}' | sort -n | head -n 1 | cut -d' ' -f2-)
+
+          if [ -n "$GRADLEW" ]; then
+            ROOT="$(dirname "$GRADLEW")"
+          else
+            # 2) tanpa gradlew: settings.gradle(.kts) paling dangkal
+            SETTINGS=$(find project -maxdepth 5 -type f \( -name settings.gradle -o -name settings.gradle.kts \) \
+              -not -path '*/__MACOSX/*' -not -path '*/.*/*' \
+              | awk '{print length($0)" "$0}' | sort -n | head -n 1 | cut -d' ' -f2-)
+            if [ -n "$SETTINGS" ]; then
+              ROOT="$(dirname "$SETTINGS")"
+            else
+              # 3) fallback: induk dari modul app/build.gradle(.kts)
+              BG=$(find project -maxdepth 6 -type f \( -path "*/app/build.gradle" -o -path "*/app/build.gradle.kts" \) \
+                -not -path '*/__MACOSX/*' | head -n 1)
+              [ -n "$BG" ] && ROOT="$(dirname "$(dirname "$BG")")"
+            fi
+          fi
+
+          if [ -z "$ROOT" ] || [ ! -d "$ROOT" ]; then
+            echo "Project Gradle tidak ditemukan di ZIP. Pastikan ini project Android Gradle." >&2
+            exit 1
+          fi
+
+          PROJECT_DIR="$(cd "$ROOT" && pwd)"
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+          echo "Root project: $PROJECT_DIR"
+
+      - name: Pilih toolchain Android (otomatis)
+        id: toolchain
+        run: |
+          cat > /tmp/androidManager.js <<'JS'
+          // <<androidManager:begin>>
+          'use strict';
+
+          /**
+           * androidManager — pemilih toolchain otomatis untuk project Android NATIVE
+           * (Gradle) di GitHub worker. Padanan Android dari flutterManager.js.
+           *
+           * File ini dipakai di dua tempat dengan isi yang sama persis:
+           *   1. worker/androidManager.js            -> sumber kebenaran (diuji lewat test/)
+           *   2. .github/workflows/build-android.yml -> salinan inline (repo GitHub worker
+           *      hanya menerima file workflow, jadi script harus ikut di dalamnya).
+           *      Salin ulang setiap selesai mengubah file ini: `node worker/androidManager.js sync`
+           *      (`sync --check` hanya memeriksa, exit 1 kalau salinan tidak sinkron).
+           *
+           * Alur (sama dengan Flutter: tentukan versi SEBELUM build, lalu build satu kali):
+           *   resolve   -> baca project, pilih Gradle & JDK, rapikan gradle.properties.
+           *   preflight -> "Pilih versi": pasang SDK/NDK/build-tools yang ditulis project, lalu cari tahu
+           *                versi yang DIBUTUHKAN dependency (AGP minimum, compileSdk minimum, dst.)
+           *                lewat task ringan check<Variant>AarMetadata. Hasilnya disimpan ke state.json.
+           *   build     -> satu kali `./gradlew assemble<Variant>` memakai hasil preflight, cari APK,
+           *                tandatangani bila perlu.
+           *   sync      -> (lokal, bukan di runner) salin file ini ke workflow.
+           *
+           * Dipakai oleh DUA worker: GitHub (via workflow) dan VPS (worker/pipeline/android.js meng-upload
+           * file ini lewat SSH lalu menjalankannya dengan Node di VPS). Pembeda: APKFORGE_ALLOW_APT=1 di VPS
+           * mengizinkan pemasangan JDK lewat apt.
+           *
+           * Tahan terhadap versi AGP/Gradle/SDK di masa depan karena dua lapis:
+           *   - PROAKTIF : tabel AGP -> Gradle minimum (hanya menaikkan, tidak pernah menurunkan).
+           *   - REAKTIF  : pesan error Gradle/AGP sendiri ("requires Android Gradle plugin X",
+           *                "compile against version N", "Minimum supported Gradle version is X")
+           *                dibaca apa adanya, jadi versi baru yang belum ada di tabel pun
+           *                tetap bisa ditangani.
+           */
+
+          const fs = require('fs');
+          const os = require('os');
+          const path = require('path');
+          const { spawn, spawnSync } = require('child_process');
+
+          const MAX_PREFLIGHT = 5;
+          const JDK_LADDER = [25, 21, 17, 11, 8];
+          const SKIP_DIRS = new Set(['node_modules', 'build', '.git', '.gradle', '.idea', '__MACOSX', 'intermediates']);
+          const APK_SKIP_DIRS = new Set(['node_modules', '.git', '.gradle', '.idea', '__MACOSX', 'intermediates']);
+
+          // Sumber: developer.android.com/build/releases/about-agp (AGP 7.x dari catatan rilis lama).
+          const AGP_MIN_GRADLE = {
+            '7.0': '7.0.2', '7.1': '7.2', '7.2': '7.3.3', '7.3': '7.4', '7.4': '7.5',
+            '8.0': '8.0', '8.1': '8.0', '8.2': '8.2', '8.3': '8.4', '8.4': '8.6', '8.5': '8.7',
+            '8.6': '8.7', '8.7': '8.9', '8.8': '8.10.2', '8.9': '8.11.1', '8.10': '8.11.1',
+            '8.11': '8.13', '8.12': '8.13', '8.13': '8.13',
+            '9.0': '9.1.0', '9.1': '9.3.1', '9.2': '9.4.1', '9.3': '9.5.0', '9.4': '9.6.0'
+          };
+          const DEFAULT_GRADLE = '8.14.6';
+
+          // ───────────────────────── versi ─────────────────────────
+
+          function parseVer(text) {
+            const m = String(text || '').trim().match(/^(\d+)(?:\.(\d+))?(?:\.(\d+))?(?:\.(\d+))?(?:[-.]?([A-Za-z][\w.]*))?/);
+            if (!m) return null;
+            return { nums: [m[1], m[2], m[3], m[4]].map(n => (n === undefined ? 0 : Number(n))), pre: m[5] || '' };
+          }
+
+          /** -1 / 0 / 1. Versi pre-rilis (alpha/beta/rc) lebih kecil dari rilis stabil. */
+          function cmpVer(a, b) {
+            const x = parseVer(a);
+            const y = parseVer(b);
+            if (!x || !y) return 0;
+            for (let i = 0; i < 4; i++) if (x.nums[i] !== y.nums[i]) return x.nums[i] < y.nums[i] ? -1 : 1;
+            if (x.pre === y.pre) return 0;
+            if (!x.pre) return 1;
+            if (!y.pre) return -1;
+            return x.pre < y.pre ? -1 : 1;
+          }
+
+          const geVer = (a, b) => cmpVer(a, b) >= 0;
+          const ltVer = (a, b) => cmpVer(a, b) < 0;
+          const maxVer = list => list.reduce((best, v) => (best === null || cmpVer(v, best) > 0 ? v : best), null);
+
+          function agpMinGradle(agp) {
+            const v = parseVer(agp);
+            if (!v) return null;
+            return AGP_MIN_GRADLE[`${v.nums[0]}.${v.nums[1]}`] || null;
+          }
+
+          // ───────────────────────── file helpers ─────────────────────────
+
+          function walk(dir, maxDepth = 4, depth = 0, out = [], skip = SKIP_DIRS) {
+            let entries;
+            try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return out; }
+            for (const e of entries) {
+              if (e.name.startsWith('.') && e.name !== '.') continue;
+              const full = path.join(dir, e.name);
+              if (e.isDirectory()) {
+                if (skip.has(e.name) || depth >= maxDepth) continue;
+                walk(full, maxDepth, depth + 1, out, skip);
+              } else if (e.isFile()) {
+                out.push(full);
+              }
+            }
+            return out;
+          }
+
+          const read = f => { try { return fs.readFileSync(f, 'utf8'); } catch { return ''; } };
+          const isGradleFile = f => /\.gradle(\.kts)?$/.test(f);
+          const isTomlFile = f => /\.toml$/.test(f) && /[\\/]gradle[\\/]/.test(f);
+
+          function buildFiles(dir) {
+            return walk(dir).filter(f => isGradleFile(f) || isTomlFile(f) || /gradle\.properties$/.test(f));
+          }
+
+          // ───────────────────────── deteksi AGP ─────────────────────────
+
+          const RE_CLASSPATH = /(com\.android\.tools\.build:gradle:)([\w.\-]+)/g;
+          const RE_CLASSPATH_VAR = /com\.android\.tools\.build:gradle:\$\{?(\w+)\}?/g;
+          const RE_PLUGIN_ID = /(id\s*\(?\s*["']com\.android\.(?:application|library|dynamic-feature|test)["']\s*\)?\s*version\s*\(?\s*["'])([\w.\-]+)(["'])/g;
+          const TOML_FALLBACK_KEYS = ['agp', 'androidGradlePlugin', 'android-gradle-plugin', 'androidGradle', 'androidPlugin'];
+
+          function tomlSections(text) {
+            const sections = {};
+            let cur = '';
+            for (const raw of String(text || '').split(/\r?\n/)) {
+              const h = raw.match(/^\s*\[([^\]]+)\]\s*$/);
+              if (h) { cur = h[1].trim(); sections[cur] = sections[cur] || []; continue; }
+              if (cur) sections[cur].push(raw);
+            }
+            return sections;
+          }
+
+          /** Kunci [versions] di toml yang dipakai oleh library/plugin com.android.* */
+          function tomlAgpKeys(text) {
+            const sec = tomlSections(text);
+            const keys = new Set();
+            for (const name of ['libraries', 'plugins']) {
+              for (const line of sec[name] || []) {
+                if (!/com\.android\.tools\.build:gradle|["']com\.android\.(application|library|dynamic-feature|test)["']/.test(line)) continue;
+                const ref = line.match(/version\.ref\s*=\s*["']([^"']+)["']/);
+                if (ref) keys.add(ref[1]);
+              }
+            }
+            if (!keys.size) {
+              for (const line of sec.versions || []) {
+                const k = line.match(/^\s*([\w.\-]+)\s*=/);
+                if (k && TOML_FALLBACK_KEYS.includes(k[1])) keys.add(k[1]);
+              }
+            }
+            return [...keys];
+          }
+
+          /**
+           * Cari versi AGP project. Kalau `newVersion` diberikan, semua deklarasi diganti
+           * (dan file ditulis ulang). Mengembalikan { version, replaced }.
+           */
+          function scanAgp(dir, newVersion = null) {
+            const files = buildFiles(dir);
+            const versions = [];
+            let replaced = 0;
+            const vars = new Set();
+
+            for (const f of files) {
+              let text = read(f);
+              if (!text) continue;
+              let changed = false;
+              const apply = (re, group) => {
+                text = text.replace(re, (...m) => {
+                  const ver = m[group];
+                  versions.push(ver);
+                  if (!newVersion) return m[0];
+                  changed = true; replaced++;
+                  const parts = m.slice(1, -2);
+                  return parts.map((p, i) => (i + 1 === group ? newVersion : p)).join('');
+                });
+              };
+
+              if (isTomlFile(f)) {
+                for (const key of tomlAgpKeys(text)) {
+                  const re = new RegExp(`^(\\s*${key.replace(/[.\-]/g, '\\$&')}\\s*=\\s*["'])([\\w.\\-]+)(["'])`, 'm');
+                  const m = text.match(re);
+                  if (!m) continue;
+                  versions.push(m[2]);
+                  if (newVersion) { text = text.replace(re, `$1${newVersion}$3`); changed = true; replaced++; }
+                }
+                // bentuk string pendek: agp = "com.android.tools.build:gradle:8.1.0"
+                apply(RE_CLASSPATH, 2);
+              } else if (isGradleFile(f)) {
+                for (const m of text.matchAll(RE_CLASSPATH_VAR)) vars.add(m[1]);
+                apply(RE_CLASSPATH, 2);
+                apply(RE_PLUGIN_ID, 2);
+              }
+              if (changed) fs.writeFileSync(f, text);
+            }
+
+            // Versi AGP yang disimpan di variabel (ext.agp_version = '8.1.0', gradle.properties, dst.)
+            for (const name of vars) {
+              for (const f of files) {
+                let text = read(f);
+                if (!text) continue;
+                const re = new RegExp(`(\\b${name}\\s*[=:]\\s*["']?)(\\d[\\w.\\-]*)(["']?)`, 'g');
+                let changed = false;
+                text = text.replace(re, (m0, a, ver, c) => {
+                  versions.push(ver);
+                  if (!newVersion) return m0;
+                  changed = true; replaced++;
+                  return `${a}${newVersion}${c}`;
+                });
+                if (changed) fs.writeFileSync(f, text);
+              }
+            }
+
+            return { version: maxVer(versions), replaced };
+          }
+
+          const detectAgp = dir => scanAgp(dir).version;
+          const setAgpVersion = (dir, v) => scanAgp(dir, v).replaced;
+
+          function usesKotlinAndroidPlugin(dir) {
+            return buildFiles(dir).some(f => /org\.jetbrains\.kotlin\.android|kotlin-android|kotlin\(\s*["']android["']\s*\)|kotlin-gradle-plugin/.test(read(f)));
+          }
+
+          /** Target Java tertinggi yang disebut project (jvmToolchain, JavaVersion, jvmTarget, ...). */
+          function detectJavaHint(dir) {
+            const text = buildFiles(dir).filter(isGradleFile).map(read).join('\n');
+            const found = [];
+            const norm = s => { const m = String(s).replace('_', '.').match(/^(\d+)(?:\.(\d+))?/); if (!m) return null; return Number(m[1]) === 1 && m[2] ? Number(m[2]) : Number(m[1]); };
+            for (const m of text.matchAll(/jvmToolchain\s*\(\s*(\d+)\s*\)/g)) found.push(Number(m[1]));
+            for (const m of text.matchAll(/JavaLanguageVersion\.of\s*\(\s*(\d+)\s*\)/g)) found.push(Number(m[1]));
+            for (const m of text.matchAll(/JavaVersion\.VERSION_(\d+(?:_\d+)?)/g)) found.push(norm(m[1]));
+            for (const m of text.matchAll(/jvmTarget\s*(?:=|\.set\s*\()\s*(?:JvmTarget\.JVM_)?["']?(\d+(?:[._]\d+)?)/g)) found.push(norm(m[1]));
+            const ok = found.filter(n => Number.isFinite(n) && n >= 6 && n <= 40);
+            return ok.length ? Math.max(...ok) : null;
+          }
+
+          // ───────────────────────── Gradle wrapper & properties ─────────────────────────
+
+          function wrapperPath(dir) { return path.join(dir, 'gradle', 'wrapper', 'gradle-wrapper.properties'); }
+
+          function readWrapper(dir) {
+            const text = read(wrapperPath(dir));
+            const m = text.match(/distributionUrl\s*=.*?gradle-(\d+(?:\.\d+){0,2}(?:-[A-Za-z0-9]+)?)-(bin|all)\.zip/);
+            return m ? { version: m[1].replace(/-(bin|all)$/, ''), type: m[2] } : null;
+          }
+
+          function setWrapperVersion(dir, version, type = 'bin') {
+            const p = wrapperPath(dir);
+            fs.mkdirSync(path.dirname(p), { recursive: true });
+            const url = `https\\://services.gradle.org/distributions/gradle-${version}-${type}.zip`;
+            let text = read(p);
+            if (!text) {
+              text = `distributionBase=GRADLE_USER_HOME\ndistributionPath=wrapper/dists\ndistributionUrl=${url}\nzipStoreBase=GRADLE_USER_HOME\nzipStorePath=wrapper/dists\n`;
+            } else {
+              text = text.replace(/^\s*distributionSha256Sum\s*=.*\r?\n?/mg, '');
+              text = text.replace(/^(\s*distributionUrl\s*=).*$/m, `$1${url}`);
+            }
+            fs.writeFileSync(p, text);
+          }
+
+          function propsPath(dir) { return path.join(dir, 'gradle.properties'); }
+
+          function setProperty(dir, key, value) {
+            const p = propsPath(dir);
+            let text = read(p);
+            const re = new RegExp(`^\\s*${key.replace(/\./g, '\\.')}\\s*=.*$`, 'm');
+            if (re.test(text)) text = text.replace(re, `${key}=${value}`);
+            else text = `${text}${text && !text.endsWith('\n') ? '\n' : ''}${key}=${value}\n`;
+            fs.writeFileSync(p, text);
+          }
+
+          function getProperty(dir, key) {
+            const m = read(propsPath(dir)).match(new RegExp(`^\\s*${key.replace(/\./g, '\\.')}\\s*=\\s*(.*)$`, 'm'));
+            return m ? m[1].trim() : null;
+          }
+
+          /** Naikkan -Xmx di org.gradle.jvmargs / kotlin.daemon.jvmargs (tidak pernah menurunkan). */
+          function ensureHeap(dir, xmxMb) {
+            const bump = (key, extra) => {
+              const cur = getProperty(dir, key);
+              if (cur === null) { setProperty(dir, key, `-Xmx${xmxMb}m${extra}`); return; }
+              const m = cur.match(/-Xmx(\d+)([mMgG])/);
+              if (!m) { setProperty(dir, key, `${cur} -Xmx${xmxMb}m`); return; }
+              const have = Number(m[1]) * (/g/i.test(m[2]) ? 1024 : 1);
+              if (have < xmxMb) setProperty(dir, key, cur.replace(m[0], `-Xmx${xmxMb}m`));
+            };
+            bump('org.gradle.jvmargs', ' -XX:MaxMetaspaceSize=768m -Dfile.encoding=UTF-8');
+            bump('kotlin.daemon.jvmargs', '');
+          }
+
+          function applyAgp9OptOut(dir) {
+            setProperty(dir, 'android.builtInKotlin', 'false');
+            setProperty(dir, 'android.newDsl', 'false');
+          }
+
+          // ───────────────────────── pemilihan JDK ─────────────────────────
+
+          function chooseJdk({ gradle, agp, hint }) {
+            let jdk;
+            if (!gradle) jdk = 17;
+            else if (ltVer(gradle, '6.7')) jdk = 8;
+            else if (ltVer(gradle, '7.3')) jdk = 11;
+            else jdk = 17;
+
+            if (agp && geVer(agp, '8.0')) jdk = Math.max(jdk, 17);
+            if (gradle && geVer(gradle, '9.0')) jdk = Math.max(jdk, 17);
+
+            if (gradle && hint) {
+              if (hint >= 25 && geVer(gradle, '9.1')) jdk = Math.max(jdk, 25);
+              else if (hint >= 21 && geVer(gradle, '8.5')) jdk = Math.max(jdk, 21);
+            }
+            return JDK_LADDER.includes(jdk) ? jdk : 17;
+          }
+
+          function findJdkHome(version) {
+            const env = process.env[`JAVA_HOME_${version}_X64`] || process.env[`JAVA_HOME_${version}_ARM64`];
+            if (env && fs.existsSync(path.join(env, 'bin', 'java'))) return env;
+            // VPS Debian/Ubuntu: /usr/lib/jvm/java-17-openjdk-amd64, temurin-17-jdk-*, dst.
+            try {
+              const re = new RegExp(`^(java-${version}-openjdk|temurin-${version}|zulu-?${version}|jdk-?${version})`);
+              for (const d of fs.readdirSync('/usr/lib/jvm')) {
+                const home = path.join('/usr/lib/jvm', d);
+                if (re.test(d) && fs.existsSync(path.join(home, 'bin', 'javac'))) return home;
+              }
+            } catch { /* tidak ada /usr/lib/jvm */ }
+            return null;
+          }
+
+          /** JAVA_HOME untuk versi JDK tertentu. Di VPS (APKFORGE_ALLOW_APT=1) JDK yang belum ada dipasang lewat apt. */
+          function javaHomeFor(version, log = () => {}) {
+            let home = findJdkHome(version);
+            if (home || process.env.APKFORGE_ALLOW_APT !== '1') return home;
+            log(`[androidManager] JDK ${version} belum ada, memasang lewat apt...`);
+            const r = spawnSync('bash', ['-c', `exec 9>/tmp/jdk-install-${version}.lock; flock 9; export DEBIAN_FRONTEND=noninteractive; apt-get update -qq && apt-get install -y -qq openjdk-${version}-jdk-headless`], { encoding: 'utf8', timeout: 15 * 60 * 1000 });
+            log(`[androidManager] apt openjdk-${version} -> exit ${r.status}`);
+            return findJdkHome(version);
+          }
+
+          // ───────────────────────── diagnosa error build ─────────────────────────
+
+          const stripAnsi = s => String(s || '').replace(/\u001b\[[0-9;]*[A-Za-z]/g, '').replace(/\r/g, '');
+
+          /**
+           * Baca log Gradle dan kembalikan daftar perbaikan yang dikenali.
+           * Berbasis kalimat pesan error, bukan nomor versi, jadi tetap jalan untuk
+           * versi AGP/Gradle/SDK yang belum ada saat file ini ditulis.
+           */
+          function diagnose(logText) {
+            const text = stripAnsi(logText);
+            const fixes = [];
+            const add = f => { if (!fixes.some(x => fixKey(x) === fixKey(f))) fixes.push(f); };
+
+            const agpReq = [...text.matchAll(/requires Android Gradle plugin ([0-9][\w.\-]*?)\s+or\s+higher/gi)].map(m => m[1].replace(/\.$/, ''));
+            if (agpReq.length) add({ type: 'agp-min', version: maxVer(agpReq) });
+
+            const sdkReq = [...text.matchAll(/compile against version (\d+(?:\.\d+)?) or later/gi)].map(m => m[1]);
+            if (sdkReq.length) add({ type: 'compile-sdk', version: maxVer(sdkReq) });
+
+            const gradleReq = [
+              ...text.matchAll(/Minimum supported Gradle version is ([0-9][\w.\-]*?)\.?\s*(?:Current|$)/gim),
+              ...text.matchAll(/requires Gradle (?:version )?([0-9][\d.]*)(?: or (?:newer|higher|later|above))/gi)
+            ].map(m => m[1].replace(/\.$/, ''));
+            if (gradleReq.length) add({ type: 'gradle-min', version: maxVer(gradleReq) });
+
+            const jdkReq = [...text.matchAll(/requires (?:Java|JDK) (\d+)(?:\.\d+)*\s+to run/gi)].map(m => Number(m[1]));
+            if (jdkReq.length) add({ type: 'jdk-min', version: Math.max(...jdkReq) });
+
+            if (/Unsupported class file major version|incompatible Java \d+|Could not determine java version from/i.test(text)) add({ type: 'jdk-too-new' });
+
+            if (/licen[cs]es? have not been accepted|licen[cs]e.*not accepted/i.test(text)) add({ type: 'licenses' });
+
+            for (const m of text.matchAll(/Failed to find (?:target with hash string|Platform SDK with path:?) ['"]?(?:platforms;)?android-(\d+(?:\.\d+)?)/gi)) add({ type: 'sdk-platform', version: m[1] });
+            for (const m of text.matchAll(/Failed to find Build Tools revision ([\d.]+)/gi)) add({ type: 'sdk-buildtools', version: m[1] });
+            for (const m of text.matchAll(/No version of NDK matched the requested version ([\d.]+)/gi)) add({ type: 'sdk-ndk', version: m[1] });
+
+            if (/java\.lang\.OutOfMemoryError|Java heap space|GC overhead limit exceeded|Metaspace|JVM heap space is exhausted/i.test(text)) add({ type: 'memory' });
+            if (/android\.useAndroidX property is not enabled/i.test(text)) add({ type: 'androidx' });
+
+            if (/Cannot add extension with name 'kotlin'|plugin is no longer required for Kotlin support|android\.builtInKotlin=false|android\.newDsl=false/i.test(text)) add({ type: 'agp9-optout' });
+
+            return fixes;
+          }
+
+          const fixKey = f => `${f.type}:${f.version || ''}`;
+
+          /** Ringkas penyebab kegagalan untuk pesan ke user. */
+          function summarizeFailure(logText) {
+            const lines = stripAnsi(logText).split('\n').map(l => l.trimEnd());
+            const i = lines.findIndex(l => /^\* What went wrong:/.test(l));
+            if (i >= 0) {
+              const out = [];
+              for (const l of lines.slice(i + 1)) {
+                if (/^\* Try:|^BUILD FAILED/.test(l)) break;
+                if (l.trim()) out.push(l.trim());
+                if (out.length >= 7) break;
+              }
+              if (out.length) return out;
+            }
+            return lines.filter(l => /error:|^e: |FAILED|Exception/.test(l)).slice(-6).map(l => l.trim());
+          }
+
+          // ───────────────────────── init script Gradle ─────────────────────────
+
+          function initScriptText() {
+            return `// dibuat otomatis oleh androidManager
+          def forcedSdk = System.getenv('APKFORGE_COMPILE_SDK')
+          allprojects {
+              // lint tidak menentukan APK jadi atau tidak; matikan supaya warning/lint tidak menggagalkan build
+              tasks.configureEach { t ->
+                  if (t.name.startsWith('lint')) { t.enabled = false }
+              }
+              afterEvaluate { p ->
+                  def android = p.extensions.findByName('android')
+                  if (android != null && forcedSdk) {
+                      try {
+                          if (forcedSdk.contains('.')) {
+                              android.compileSdkVersion("android-" + forcedSdk)
+                          } else {
+                              def cur = null
+                              try { cur = android.compileSdk } catch (Throwable ignore) { }
+                              if (cur == null || cur < forcedSdk.toInteger()) { android.compileSdk = forcedSdk.toInteger() }
+                          }
+                      } catch (Throwable e) {
+                          p.logger.warn("[androidManager] gagal set compileSdk di " + p.path + ": " + e.message)
+                      }
+                  }
+              }
+          }
+          `;
+          }
+
+          // ───────────────────────── Android SDK ─────────────────────────
+
+          function sdkRoot() {
+            return process.env.ANDROID_HOME || process.env.ANDROID_SDK_ROOT || '/usr/local/lib/android/sdk';
+          }
+
+          function sdkmanagerBin() {
+            const p = path.join(sdkRoot(), 'cmdline-tools', 'latest', 'bin', 'sdkmanager');
+            return fs.existsSync(p) ? p : null;
+          }
+
+          function sdkInstall(packages, log) {
+            const bin = sdkmanagerBin();
+            if (!bin) { log('sdkmanager tidak ditemukan, lewati pemasangan SDK'); return false; }
+            const r = spawnSync('bash', ['-c', `yes | "${bin}" --sdk_root="${sdkRoot()}" ${packages.map(p => `"${p}"`).join(' ')}`], { encoding: 'utf8', timeout: 10 * 60 * 1000 });
+            log(`sdkmanager ${packages.join(' ')} -> exit ${r.status}`);
+            return r.status === 0;
+          }
+
+          function acceptLicenses(log) {
+            const bin = sdkmanagerBin();
+            if (!bin) return false;
+            const r = spawnSync('bash', ['-c', `yes | "${bin}" --sdk_root="${sdkRoot()}" --licenses`], { encoding: 'utf8', timeout: 5 * 60 * 1000 });
+            log(`sdkmanager --licenses -> exit ${r.status}`);
+            return r.status === 0;
+          }
+
+          // ───────────────────────── Gradle wrapper (untuk worker VPS) ─────────────────────────
+
+          function wrapperValid(dir) {
+            const jar = path.join(dir, 'gradle', 'wrapper', 'gradle-wrapper.jar');
+            try {
+              return fs.existsSync(path.join(dir, 'gradlew')) && fs.statSync(jar).size > 0
+                && fs.readFileSync(jar).includes('org/gradle/wrapper/GradleWrapperMain.class');
+            } catch { return false; }
+          }
+
+          /** Buat gradlew + gradle-wrapper.jar bila hilang/rusak (ZIP user sering tidak menyertakan jar). */
+          function ensureWrapper(dir, state, log) {
+            if (wrapperValid(dir)) return true;
+            const w = readWrapper(dir);
+            const ver = w ? w.version : DEFAULT_GRADLE;
+            log(`[androidManager] Gradle wrapper tidak lengkap -> membuat ulang (Gradle ${ver})`);
+            const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'apkforge-gw-'));
+            try {
+              const run = (cmd, env) => spawnSync('bash', ['-c', cmd], { encoding: 'utf8', timeout: 10 * 60 * 1000, env: env || process.env });
+              let r = run(`curl -fsSL -o "${tmp}/g.zip" "https://services.gradle.org/distributions/gradle-${ver}-bin.zip" && unzip -q "${tmp}/g.zip" -d "${tmp}/dist"`);
+              if (r.status !== 0) throw new Error(`unduh Gradle ${ver}: ${r.stderr}`);
+              fs.mkdirSync(path.join(tmp, 'gen'));
+              fs.writeFileSync(path.join(tmp, 'gen', 'settings.gradle'), '');
+              const env = { ...process.env };
+              const home = javaHomeFor(state.jdk, log);
+              if (home) { env.JAVA_HOME = home; env.PATH = `${home}/bin:${env.PATH}`; }
+              r = spawnSync(path.join(tmp, 'dist', `gradle-${ver}`, 'bin', 'gradle'), ['wrapper', '--gradle-version', ver, '--distribution-type', 'bin', '--no-daemon'], { cwd: path.join(tmp, 'gen'), encoding: 'utf8', timeout: 10 * 60 * 1000, env });
+              if (r.status !== 0) throw new Error(`gradle wrapper: ${r.stderr || r.stdout}`);
+              fs.mkdirSync(path.join(dir, 'gradle', 'wrapper'), { recursive: true });
+              fs.copyFileSync(path.join(tmp, 'gen', 'gradle', 'wrapper', 'gradle-wrapper.jar'), path.join(dir, 'gradle', 'wrapper', 'gradle-wrapper.jar'));
+              if (!fs.existsSync(wrapperPath(dir))) fs.copyFileSync(path.join(tmp, 'gen', 'gradle', 'wrapper', 'gradle-wrapper.properties'), wrapperPath(dir));
+              if (!fs.existsSync(path.join(dir, 'gradlew'))) fs.copyFileSync(path.join(tmp, 'gen', 'gradlew'), path.join(dir, 'gradlew'));
+              fs.chmodSync(path.join(dir, 'gradlew'), 0o755);
+              return true;
+            } catch (e) {
+              log(`[androidManager] Gagal membuat wrapper: ${e.message}`);
+              return false;
+            } finally {
+              fs.rmSync(tmp, { recursive: true, force: true });
+            }
+          }
+
+          // ───────────────────────── mode: resolve ─────────────────────────
+
+          function resolveProject(dir, log = console.log) {
+            const wrapper = readWrapper(dir);
+            const agp = detectAgp(dir);
+            const hint = detectJavaHint(dir);
+            const kotlinAndroid = usesKotlinAndroidPlugin(dir);
+
+            let gradle = wrapper ? wrapper.version : null;
+            const notes = [];
+
+            const need = agp ? agpMinGradle(agp) : null;
+            if (!gradle) {
+              gradle = need || DEFAULT_GRADLE;
+              setWrapperVersion(dir, gradle);
+              notes.push(`wrapper tidak ada -> Gradle ${gradle}`);
+            } else if (need && ltVer(gradle, need)) {
+              notes.push(`Gradle ${gradle} < minimum AGP ${agp} (${need}) -> dinaikkan ke ${need}`);
+              gradle = need;
+              setWrapperVersion(dir, gradle, wrapper.type);
+            }
+
+            if (agp && geVer(agp, '9.0') && kotlinAndroid) {
+              applyAgp9OptOut(dir);
+              notes.push('AGP 9 + plugin kotlin-android -> opt-out built-in Kotlin/new DSL');
+            }
+
+            ensureHeap(dir, 3072);
+            const jdk = chooseJdk({ gradle, agp, hint });
+
+            log(`[androidManager] AGP=${agp || '?'} Gradle=${gradle} javaHint=${hint || '-'} kotlin-android=${kotlinAndroid} -> JDK ${jdk}`);
+            notes.forEach(n => log(`[androidManager] ${n}`));
+            return { agp, gradle, jdk, hint, notes };
+          }
+
+          // ───────────────────────── mode: build ─────────────────────────
+
+          function runGradle(dir, args, env, quiet) {
+            return new Promise(resolve => {
+              const child = spawn('./gradlew', args, { cwd: dir, env, stdio: ['ignore', 'pipe', 'pipe'] });
+              let buf = '';
+              const keep = chunk => {
+                if (!quiet) process.stdout.write(chunk);
+                buf += chunk.toString();
+                if (buf.length > 3_000_000) buf = buf.slice(-2_000_000);
+              };
+              child.stdout.on('data', keep);
+              child.stderr.on('data', keep);
+              child.on('error', e => { buf += `\nspawn error: ${e.message}`; resolve({ code: 1, output: buf }); });
+              child.on('close', code => resolve({ code: code === null ? 1 : code, output: buf }));
+            });
+          }
+
+          function findApks(dir, buildType) {
+            const all = walk(dir, 8, 0, [], APK_SKIP_DIRS).filter(f => /\.apk$/i.test(f) && /[\\/]build[\\/]outputs[\\/]apk[\\/]/.test(f) && !/androidTest/i.test(f));
+            const typed = all.filter(f => f.toLowerCase().includes(buildType));
+            const list = typed.length ? typed : all;
+            return list
+              .map(f => ({ f, size: fs.statSync(f).size, unsigned: /unsigned/i.test(path.basename(f)) }))
+              .sort((a, b) => (a.unsigned - b.unsigned) || (b.size - a.size));
+          }
+
+          /** Tandatangani APK release yang belum bertanda tangan memakai keystore debug (supaya bisa dipasang). */
+          function signWithDebugKey(apk, outFile, log) {
+            try {
+              const btDir = path.join(sdkRoot(), 'build-tools');
+              const latest = fs.readdirSync(btDir).filter(v => /^\d/.test(v)).sort((a, b) => cmpVer(a, b)).pop();
+              const zipalign = path.join(btDir, latest, 'zipalign');
+              const apksigner = path.join(btDir, latest, 'apksigner');
+              const ks = path.join(path.dirname(outFile), 'debug.keystore');
+              if (!fs.existsSync(ks)) {
+                const k = spawnSync('keytool', ['-genkeypair', '-keystore', ks, '-storepass', 'android', '-keypass', 'android', '-alias', 'androiddebugkey', '-keyalg', 'RSA', '-keysize', '2048', '-validity', '10000', '-dname', 'CN=Android Debug,O=Android,C=US'], { encoding: 'utf8' });
+                if (k.status !== 0) throw new Error(`keytool: ${k.stderr}`);
+              }
+              const aligned = `${outFile}.aligned`;
+              let r = spawnSync(zipalign, ['-p', '-f', '4', apk, aligned], { encoding: 'utf8' });
+              if (r.status !== 0) throw new Error(`zipalign: ${r.stderr || r.stdout}`);
+              r = spawnSync(apksigner, ['sign', '--ks', ks, '--ks-pass', 'pass:android', '--key-pass', 'pass:android', '--out', outFile, aligned], { encoding: 'utf8' });
+              fs.rmSync(aligned, { force: true });
+              if (r.status !== 0) throw new Error(`apksigner: ${r.stderr || r.stdout}`);
+              log('APK release tidak bertanda tangan -> ditandatangani dengan debug key');
+              return true;
+            } catch (e) {
+              log(`Gagal menandatangani APK (${e.message}); APK dikirim apa adanya`);
+              return false;
+            }
+          }
+
+          // State dibagi antara tahap preflight dan build (JDK terpilih, compileSdk hasil penyesuaian).
+          const stateFile = outDir => path.join(outDir, 'state.json');
+
+          function loadState(outDir, jdk) {
+            try {
+              const s = JSON.parse(fs.readFileSync(stateFile(outDir), 'utf8'));
+              return { jdk: s.jdk || jdk, compileSdk: s.compileSdk || null, applied: new Set(s.applied || []), history: s.history || [] };
+            } catch { return { jdk, compileSdk: null, applied: new Set(), history: [] }; }
+          }
+
+          function saveState(outDir, st) {
+            fs.mkdirSync(outDir, { recursive: true });
+            fs.writeFileSync(stateFile(outDir), JSON.stringify({ jdk: st.jdk, compileSdk: st.compileSdk, applied: [...st.applied], history: st.history }));
+          }
+
+          function runContext(dir, opts) {
+            const buildType = String(opts.buildType || 'release').toLowerCase() === 'debug' ? 'debug' : 'release';
+            const outDir = path.resolve(opts.outDir || 'apkforge-out');
+            fs.mkdirSync(outDir, { recursive: true });
+            const initFile = path.join(outDir, 'apkforge-init.gradle');
+            fs.writeFileSync(initFile, initScriptText());
+            return { buildType, outDir, initFile, log: opts.log || console.log };
+          }
+
+          function gradleRun(dir, task, ctx, state, quiet) {
+            const env = { ...process.env };
+            const home = javaHomeFor(state.jdk, ctx.log);
+            if (home) { env.JAVA_HOME = home; env.PATH = `${home}/bin:${env.PATH}`; }
+            if (state.compileSdk) env.APKFORGE_COMPILE_SDK = String(state.compileSdk);
+            const args = [task, '--no-daemon', '--console=plain', '-I', ctx.initFile];
+            if (state.compileSdk) args.push(`-Pandroid.suppressUnsupportedCompileSdk=${String(state.compileSdk).split('.')[0]}`);
+            ctx.log(`[androidManager] ./gradlew ${args.join(' ')} (JDK ${state.jdk})`);
+            return runGradle(dir, args, env, quiet);
+          }
+
+          /** compileSdk / NDK / build-tools yang DITULIS project (build.gradle, atau version catalog). */
+          function declaredSdk(dir) {
+            const files = buildFiles(dir);
+            const gradleText = files.filter(isGradleFile).map(read).join('\n');
+            const tomlText = files.filter(isTomlFile).map(read).join('\n');
+            const sdks = [];
+            for (const m of gradleText.matchAll(/compileSdk(?:Version)?\s*(?:=|\s)\s*(?:["']android-)?(\d+)/g)) sdks.push(m[1]);
+            for (const m of gradleText.matchAll(/compileSdk\s*\{[^}]*release\(\s*(\d+)/g)) sdks.push(m[1]);
+            for (const m of tomlText.matchAll(/^\s*[\w.\-]*compile[_\-]?sdk[\w.\-]*\s*=\s*["'](\d+)["']/gim)) sdks.push(m[1]);
+            const ndk = gradleText.match(/ndkVersion\s*=?\s*["']([\d.]+)["']/);
+            const bt = gradleText.match(/buildToolsVersion\s*=?\s*["']([\d.]+)["']/);
+            return { compileSdk: maxVer(sdks), ndk: ndk ? ndk[1] : null, buildTools: bt ? bt[1] : null };
+          }
+
+          /** Pasang bagian Android SDK yang diminta project tetapi belum ada di runner. */
+          function ensureProjectSdk(dir, log) {
+            const want = declaredSdk(dir);
+            const root = sdkRoot();
+            const missing = [];
+            if (want.compileSdk && !fs.existsSync(path.join(root, 'platforms', `android-${want.compileSdk}`))) missing.push(`platforms;android-${want.compileSdk}`);
+            if (want.buildTools && !fs.existsSync(path.join(root, 'build-tools', want.buildTools))) missing.push(`build-tools;${want.buildTools}`);
+            if (want.ndk && !fs.existsSync(path.join(root, 'ndk', want.ndk))) missing.push(`ndk;${want.ndk}`);
+            log(`[androidManager] SDK project: compileSdk=${want.compileSdk || '-'} buildTools=${want.buildTools || '-'} ndk=${want.ndk || '-'}${missing.length ? ` -> memasang ${missing.join(', ')}` : ' (sudah lengkap)'}`);
+            if (missing.length) { acceptLicenses(log); sdkInstall(missing, log); }
+            return want;
+          }
+
+          /**
+           * TAHAP "Pilih versi" (padanan pick-flutter): sebelum build, cari tahu versi yang DIBUTUHKAN project.
+           * Syarat dependency Android (AGP minimum, compileSdk minimum) hanya terbaca oleh Gradle sendiri,
+           * jadi dijalankan task ringan check<Variant>AarMetadata (tanpa kompilasi) dan pesannya dibaca.
+           * Hasilnya (versi yang dipakai) disimpan ke state.json untuk tahap build.
+           */
+          async function preflightProject(dir, opts = {}) {
+            const ctx = runContext(dir, opts);
+            const state = loadState(ctx.outDir, opts.jdk || 17);
+            const task = `check${ctx.buildType === 'debug' ? 'Debug' : 'Release'}AarMetadata`;
+            ensureWrapper(dir, state, ctx.log);
+            try { fs.chmodSync(path.join(dir, 'gradlew'), 0o755); } catch { /* sudah executable / tidak ada */ }
+            ensureProjectSdk(dir, ctx.log);
+
+            for (let attempt = 1; attempt <= MAX_PREFLIGHT; attempt++) {
+              const { code, output } = await gradleRun(dir, task, ctx, state, opts.quiet);
+              if (code === 0) { ctx.log('[androidManager] Pemeriksaan versi: project cocok.'); break; }
+              const fixes = diagnose(output).filter(f => !state.applied.has(fixKey(f)));
+              if (!fixes.length) { ctx.log('[androidManager] Pemeriksaan versi: tidak ada penyesuaian yang dikenali, lanjut ke build.'); break; }
+              for (const fix of fixes) {
+                state.applied.add(fixKey(fix));
+                const msg = applyFix(dir, fix, state, ctx.log);
+                if (msg) state.history.push(msg);
+              }
+            }
+            saveState(ctx.outDir, state);
+            return { jdk: state.jdk, compileSdk: state.compileSdk, history: state.history };
+          }
+
+          /** TAHAP build: satu kali `assemble`, memakai hasil tahap preflight. */
+          async function buildProject(dir, opts = {}) {
+            const ctx = runContext(dir, opts);
+            const state = loadState(ctx.outDir, opts.jdk || 17);
+            const task = `assemble${ctx.buildType === 'debug' ? 'Debug' : 'Release'}`;
+            ensureWrapper(dir, state, ctx.log);
+            try { fs.chmodSync(path.join(dir, 'gradlew'), 0o755); } catch { /* sudah executable / tidak ada */ }
+
+            const { code, output } = await gradleRun(dir, task, ctx, state, opts.quiet);
+            if (code !== 0) return { ok: false, history: state.history, error: summarizeFailure(output) };
+
+            const apks = findApks(dir, ctx.buildType);
+            if (!apks.length) return { ok: false, history: state.history, error: ['Build sukses tetapi file APK tidak ditemukan di build/outputs/apk.'] };
+            const best = apks[0];
+            const finalApk = path.join(ctx.outDir, `app-${ctx.buildType}.apk`);
+            if (best.unsigned) {
+              if (!signWithDebugKey(best.f, finalApk, ctx.log)) fs.copyFileSync(best.f, finalApk);
+            } else {
+              fs.copyFileSync(best.f, finalApk);
+            }
+            ctx.log(`[androidManager] APK: ${best.f}`);
+            return { ok: true, apk: finalApk, history: state.history };
+          }
+
+          /** Terapkan satu perbaikan. Mengembalikan deskripsi singkat (atau null kalau tidak ada yang berubah). */
+          function applyFix(dir, fix, state, log) {
+            switch (fix.type) {
+              case 'agp-min': {
+                const cur = detectAgp(dir);
+                if (cur && geVer(cur, fix.version)) return null;
+                const n = setAgpVersion(dir, fix.version);
+                let msg = `AGP ${cur || '?'} -> ${fix.version} (${n} deklarasi)`;
+                const need = agpMinGradle(fix.version);
+                const w = readWrapper(dir);
+                if (need && (!w || ltVer(w.version, need))) { setWrapperVersion(dir, need, w ? w.type : 'bin'); msg += `, Gradle -> ${need}`; }
+                if (usesKotlinAndroidPlugin(dir) && geVer(fix.version, '9.0')) { applyAgp9OptOut(dir); msg += ', opt-out built-in Kotlin'; }
+                if (geVer(fix.version, '8.0') && state.jdk < 17) state.jdk = 17;
+                log(`[androidManager] FIX ${msg}`);
+                return msg;
+              }
+              case 'compile-sdk': {
+                if (state.compileSdk && geVer(state.compileSdk, fix.version)) return null;
+                state.compileSdk = fix.version;
+                sdkInstall([`platforms;android-${fix.version}`], log);
+                const msg = `compileSdk dinaikkan ke ${fix.version} (semua modul)`;
+                log(`[androidManager] FIX ${msg}`);
+                return msg;
+              }
+              case 'gradle-min': {
+                const w = readWrapper(dir);
+                if (w && geVer(w.version, fix.version)) return null;
+                setWrapperVersion(dir, fix.version, w ? w.type : 'bin');
+                const msg = `Gradle ${w ? w.version : '?'} -> ${fix.version}`;
+                log(`[androidManager] FIX ${msg}`);
+                return msg;
+              }
+              case 'jdk-min': {
+                const target = JDK_LADDER.slice().reverse().find(v => v >= fix.version) || fix.version;
+                if (state.jdk >= target) return null;
+                state.jdk = target;
+                const msg = `JDK -> ${target}`;
+                log(`[androidManager] FIX ${msg}`);
+                return msg;
+              }
+              case 'jdk-too-new': {
+                const lower = JDK_LADDER.find(v => v < state.jdk);
+                if (!lower) return null;
+                state.jdk = lower;
+                const msg = `JDK terlalu baru untuk Gradle project -> turun ke ${lower}`;
+                log(`[androidManager] FIX ${msg}`);
+                return msg;
+              }
+              case 'licenses': acceptLicenses(log); return 'Lisensi Android SDK diterima';
+              case 'sdk-platform': sdkInstall([`platforms;android-${fix.version}`], log); return `Memasang platform android-${fix.version}`;
+              case 'sdk-buildtools': sdkInstall([`build-tools;${fix.version}`], log); return `Memasang build-tools ${fix.version}`;
+              case 'sdk-ndk': sdkInstall([`ndk;${fix.version}`], log); return `Memasang NDK ${fix.version}`;
+              case 'memory': ensureHeap(dir, 5120); return 'Memori Gradle dinaikkan ke 5 GB';
+              case 'androidx': setProperty(dir, 'android.useAndroidX', 'true'); return 'android.useAndroidX=true';
+              case 'agp9-optout': applyAgp9OptOut(dir); return 'Opt-out built-in Kotlin/new DSL (AGP 9)';
+              default: return null;
+            }
+          }
+
+          // ───────────────────────── mode: sync (dipakai developer, bukan runner) ─────────────────────────
+
+          /** Salin file ini ke build-android.yml di antara penanda begin/end. Return true kalau sudah sinkron. */
+          function syncWorkflow({ check = false, wfPath = path.join(__dirname, '..', '.github', 'workflows', 'build-android.yml') } = {}) {
+            // shebang tidak valid di tengah file, jadi dibuang saat disalin
+            const src = fs.readFileSync(__filename, 'utf8').replace(/^#!.*\n/, '').replace(/\s+$/, '');
+            const wf = fs.readFileSync(wfPath, 'utf8');
+            const re = /^( *\/\/ <<androidManager:begin>>\n)[\s\S]*?(^ *\/\/ <<androidManager:end>>)/m;
+            if (!re.test(wf)) throw new Error('Penanda androidManager tidak ditemukan di build-android.yml');
+            const body = src.split('\n').map(l => (l ? ' '.repeat(10) + l : '')).join('\n');
+            const next = wf.replace(re, (m0, begin, end) => `${begin}${body}\n${end}`);
+            if (check) return next === wf;
+            fs.writeFileSync(wfPath, next);
+            return true;
+          }
+
+          // ───────────────────────── CLI ─────────────────────────
+
+          function emitOutputs(values) {
+            // Baris ini dibaca pipeline VPS (stdout lewat SSH); di GitHub hanya GITHUB_OUTPUT yang dipakai.
+            Object.entries(values).forEach(([k, v]) => console.log(`APKFORGE_OUTPUT ${k}=${v}`));
+            const f = process.env.GITHUB_OUTPUT;
+            if (!f) return;
+            fs.appendFileSync(f, Object.entries(values).map(([k, v]) => `${k}=${v}\n`).join(''));
+          }
+
+          function emitSummary(lines) {
+            const f = process.env.GITHUB_STEP_SUMMARY;
+            if (f) fs.appendFileSync(f, `${lines.join('\n')}\n`);
+          }
+
+          async function main() {
+            const mode = process.argv[2];
+
+            if (mode === 'sync') {
+              const check = process.argv.includes('--check');
+              const ok = syncWorkflow({ check });
+              if (check && !ok) { console.error('build-android.yml tidak sinkron dengan worker/androidManager.js. Jalankan: node worker/androidManager.js sync'); process.exit(1); }
+              console.log(check ? 'build-android.yml sinkron.' : 'build-android.yml diperbarui.');
+              return;
+            }
+
+            const dir = process.env.PROJECT_DIR;
+            if (!dir || !fs.existsSync(dir)) { console.error('PROJECT_DIR tidak valid'); process.exit(1); }
+
+            if (mode === 'resolve') {
+              const r = resolveProject(dir);
+              emitOutputs({ jdk: r.jdk, gradle: r.gradle, agp: r.agp || '' });
+              emitSummary(['### Toolchain Android (otomatis)', `- AGP: \`${r.agp || 'tidak terdeteksi'}\``, `- Gradle: \`${r.gradle}\``, `- JDK: \`${r.jdk}\``, ...r.notes.map(n => `- ${n}`)]);
+              return;
+            }
+
+            const runOpts = { buildType: process.env.BUILD_TYPE, jdk: Number(process.env.JDK_VERSION) || 17, outDir: process.env.APKFORGE_OUT_DIR || path.join(process.env.GITHUB_WORKSPACE || process.cwd(), 'apkforge-out') };
+
+            if (mode === 'preflight') {
+              const r = await preflightProject(dir, runOpts);
+              emitSummary(['### Penyesuaian versi project', `- JDK build: \`${r.jdk}\``, `- compileSdk: \`${r.compileSdk || 'sesuai project'}\``, ...(r.history.length ? r.history.map(h => `- ${h}`) : ['- Tidak ada penyesuaian, project sudah cocok'])]);
+              return;
+            }
+
+            if (mode === 'build') {
+              const res = await buildProject(dir, runOpts);
+              emitSummary(['### Hasil build', res.ok ? '- Sukses' : '- Gagal', ...res.history.map(h => `- ${h}`)]);
+              if (res.ok) { emitOutputs({ apk: res.apk }); return; }
+              // Blok ini dibaca githubWorker.summarizeLog (baris pertama memuat penanda "[ApkForge]").
+              console.log(`Error: [ApkForge] Build Android gagal${res.history.length ? ` setelah perbaikan otomatis (${res.history.join('; ')})` : ''}`);
+              (res.error || []).forEach(l => console.log(l));
+              process.exit(1);
+            }
+
+            console.error('Pakai: androidManager.js resolve|preflight|build|sync');
+            process.exit(2);
+          }
+
+          module.exports = {
+            parseVer, cmpVer, agpMinGradle, detectAgp, setAgpVersion, usesKotlinAndroidPlugin, detectJavaHint,
+            readWrapper, setWrapperVersion, setProperty, getProperty, ensureHeap, chooseJdk, diagnose, summarizeFailure,
+            findJdkHome, wrapperValid, ensureWrapper, resolveProject, preflightProject, buildProject, declaredSdk, findApks, applyFix, initScriptText, syncWorkflow, AGP_MIN_GRADLE
+          };
+
+          if (require.main === module) main().catch(e => { console.error(`Error: ${e.stack || e.message}`); process.exit(1); });
+          // <<androidManager:end>>
+          JS
+          node /tmp/androidManager.js resolve
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'zulu'
+          java-version: ${{ steps.toolchain.outputs.jdk }}
+
+      - name: Fix Gradle Wrapper
+        run: |
+          WRAPPER_DIR="$PROJECT_DIR/gradle/wrapper"
+          mkdir -p "$WRAPPER_DIR"
+          PROPS="$WRAPPER_DIR/gradle-wrapper.properties"
+          JAR="$WRAPPER_DIR/gradle-wrapper.jar"
+
+          # Jar yang ada dianggap valid hanya kalau berisi GradleWrapperMain,
+          # dan gradlew harus ada.
+          if [ -s "$JAR" ] && unzip -l "$JAR" | grep -q 'org/gradle/wrapper/GradleWrapperMain.class' && [ -f "$PROJECT_DIR/gradlew" ]; then
+            echo "Gradle wrapper valid."
+            exit 0
+          fi
+
+          # Versi Gradle sudah ditentukan step "Pilih toolchain Android"
+          GRADLE_VER="${{ steps.toolchain.outputs.gradle }}"
+          echo "Versi Gradle: $GRADLE_VER"
+
+          wget -q "https://services.gradle.org/distributions/gradle-${GRADLE_VER}-bin.zip" -O /tmp/gradle.zip
+          unzip -q /tmp/gradle.zip -d /tmp/gradle-dist
+
+          # Generate wrapper di folder terpisah (settings.gradle kosong, wajib untuk Gradle 8.x+)
+          mkdir -p /tmp/wrapgen
+          touch /tmp/wrapgen/settings.gradle
+          (cd /tmp/wrapgen && /tmp/gradle-dist/gradle-${GRADLE_VER}/bin/gradle wrapper \
+            --gradle-version "$GRADLE_VER" --distribution-type bin --no-daemon)
+
+          cp /tmp/wrapgen/gradle/wrapper/gradle-wrapper.jar "$JAR"
+          [ -f "$PROPS" ] || cp /tmp/wrapgen/gradle/wrapper/gradle-wrapper.properties "$PROPS"
+          [ -f "$PROJECT_DIR/gradlew" ] || cp /tmp/wrapgen/gradlew "$PROJECT_DIR/gradlew"
+
+          unzip -l "$JAR" | grep -q 'GradleWrapperMain.class' || { echo "Jar masih tidak valid" >&2; exit 1; }
+          echo "gradle-wrapper.jar size: $(stat -c%s "$JAR")"
+
+      - name: Pilih versi Android (cek kebutuhan project)
+        env:
+          JDK_VERSION: ${{ steps.toolchain.outputs.jdk }}
+        run: |
+          # Padanan "Pilih versi Flutter": SEBELUM build, pasang SDK/NDK yang ditulis project
+          # dan cari tahu versi yang dibutuhkan dependency (AGP minimum, compileSdk minimum, ...)
+          # lewat task ringan check<Variant>AarMetadata. Hasilnya dipakai step Build.
+          node /tmp/androidManager.js preflight
+
+      - name: Build APK
+        id: build
+        env:
+          JDK_VERSION: ${{ steps.toolchain.outputs.jdk }}
+        run: |
+          # Satu kali build, memakai versi hasil step sebelumnya (seperti build Flutter).
+          node /tmp/androidManager.js build
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk-${{ github.event.inputs.jobId }}
+          path: ${{ steps.build.outputs.apk }}
+          if-no-files-found: error
