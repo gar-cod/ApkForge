@@ -1,0 +1,303 @@
+name: Build Flutter APK (Fallback Worker)
+
+on:
+  workflow_dispatch:
+    inputs:
+      jobId:
+        description: 'Job ID from Bot'
+        required: true
+      userId:
+        description: 'User ID'
+        required: true
+      payload:
+        description: 'Build Payload (JSON)'
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'zulu'
+          java-version: '17'
+
+      - name: Prepare Project
+        env:
+          # Jangan interpolasi ${{ }} langsung ke script shell (command injection).
+          PAYLOAD: ${{ github.event.inputs.payload }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Payload bisa berisi 2 bentuk source:
+          # - "url"         -> mode "URL ke APK", link ZIP publik biasa
+          # - "zipAssetUrl" -> mode "ZIP Project", asset GitHub Release
+          #                    (perlu header auth, bukan wget biasa)
+          URL=$(printf '%s' "$PAYLOAD" | jq -r '.url')
+          ZIP_ASSET_URL=$(printf '%s' "$PAYLOAD" | jq -r '.zipAssetUrl')
+
+          if [ "$URL" != "null" ] && [ -n "$URL" ]; then
+            wget -O project.zip "$URL"
+          elif [ "$ZIP_ASSET_URL" != "null" ] && [ -n "$ZIP_ASSET_URL" ]; then
+            curl -L \
+              -H "Authorization: token $GH_TOKEN" \
+              -H "Accept: application/octet-stream" \
+              -o project.zip \
+              "$ZIP_ASSET_URL"
+          else
+            echo "Tidak ada source project (url maupun zipAssetUrl) di payload." >&2
+            exit 1
+          fi
+
+          rm -rf extracted
+          unzip -q project.zip -d extracted
+
+          # Cari root project Flutter (pubspec.yaml paling dangkal, maks 5 level),
+          # supaya ZIP yang dibungkus folder tetap terbaca.
+          PUBSPEC=$(find extracted -maxdepth 5 -type f -name pubspec.yaml \
+            -not -path '*/__MACOSX/*' -not -path '*/.*/*' -not -path '*/example/*' \
+            | awk '{print length($0) " " $0}' | sort -n | head -n 1 | cut -d' ' -f2-)
+
+          if [ -z "$PUBSPEC" ]; then
+            echo "pubspec.yaml tidak ditemukan di ZIP. Pastikan ini project Flutter." >&2
+            exit 1
+          fi
+
+          PROJECT_DIR="$(cd "$(dirname "$PUBSPEC")" && pwd)"
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+          echo "Root project: $PROJECT_DIR"
+
+      - name: Pilih versi Flutter
+        id: flutterver
+        run: |
+          cat > /tmp/pick-flutter.js <<'JS'
+          // Pilih versi Flutter dari pubspec.yaml (logika sama dengan worker/flutterManager.js)
+          const fs = require('fs');
+          const MIN_FLUTTER = [3, 38, 0];
+          const parseVer = t => { const m = String(t || '').match(/(\d+)\.(\d+)\.(\d+)/); return m ? [+m[1], +m[2], +m[3]] : null; };
+          const cmp = (a, b) => { for (let i = 0; i < 3; i++) if (a[i] !== b[i]) return a[i] < b[i] ? -1 : 1; return 0; };
+
+          function checkPart(v, part) {
+            const c = part.match(/^\^(.+)$/);
+            if (c) {
+              const b = parseVer(c[1]); if (!b) return true;
+              const up = b[0] > 0 ? [b[0] + 1, 0, 0] : b[1] > 0 ? [0, b[1] + 1, 0] : [0, 0, b[2] + 1];
+              return cmp(v, b) >= 0 && cmp(v, up) < 0;
+            }
+            const m = part.match(/^(>=|<=|>|<|==|=)?(.+)$/); if (!m) return true;
+            const t = parseVer(m[2]); if (!t) return true;
+            const r = cmp(v, t);
+            switch (m[1]) { case '>=': return r >= 0; case '<=': return r <= 0; case '>': return r > 0; case '<': return r < 0; default: return r === 0; }
+          }
+          function satisfies(v, constraint) {
+            const raw = String(constraint || '').trim().replace(/^['"]|['"]$/g, '');
+            if (!raw || raw === 'any') return true;
+            return raw.replace(/(>=|<=|==|>|<|=|\^)\s+/g, '$1').split(/\s+/).filter(Boolean).every(p => checkPart(v, p));
+          }
+          function parseEnv(text) {
+            const out = {}; let inEnv = false;
+            for (const raw of String(text || '').split(/\r?\n/)) {
+              if (/^environment:\s*(#.*)?$/.test(raw)) { inEnv = true; continue; }
+              if (!inEnv) continue;
+              if (/^[^\s#]/.test(raw)) break;
+              const m = raw.match(/^\s+(sdk|flutter)\s*:\s*(.+?)\s*(#.*)?$/);
+              if (m) out[m[1]] = m[2].trim().replace(/^['"]|['"]$/g, '');
+            }
+            return out;
+          }
+          function stableByMinor(json) {
+            const by = new Map();
+            for (const r of json.releases || []) {
+              if (r.channel !== 'stable') continue;
+              const v = parseVer(r.version);
+              if (!v || cmp(v, MIN_FLUTTER) < 0) continue;
+              const k = v[0] + '.' + v[1], p = by.get(k);
+              if (p && cmp(p.v, v) >= 0) continue;
+              by.set(k, { v, str: v.join('.'), dart: parseVer(r.dart_sdk_version) });
+            }
+            return [...by.values()].sort((a, b) => cmp(a.v, b.v));
+          }
+          function choose(env, list) {
+            for (const r of list) {
+              if (env.flutter && !satisfies(r.v, env.flutter)) continue;
+              if (env.sdk && r.dart && !satisfies(r.dart, env.sdk)) continue;
+              return r;
+            }
+            return null;
+          }
+
+          module.exports = { parseEnv, stableByMinor, choose, satisfies };
+
+          if (require.main === module) (async () => {
+            const out = process.env.GITHUB_OUTPUT;
+            const emit = v => { console.log('Flutter dipilih:', v || '(stable terbaru)'); if (out) fs.appendFileSync(out, `version=${v}\n`); };
+            let env = {};
+            try { env = parseEnv(fs.readFileSync((process.env.PROJECT_DIR || 'project') + '/pubspec.yaml', 'utf8')); }
+            catch (e) { console.log('pubspec.yaml tidak terbaca:', e.message); return emit(''); }
+            console.log('Constraint project:', JSON.stringify(env));
+            if (!env.sdk && !env.flutter) return emit('');
+            let list;
+            try {
+              const res = await fetch('https://storage.googleapis.com/flutter_infra_release/releases/releases_linux.json');
+              list = stableByMinor(await res.json());
+            } catch (e) { console.log('Gagal ambil daftar rilis:', e.message); return emit(''); }
+            const pick = choose(env, list);
+            if (!pick) {
+              const last = list[list.length - 1];
+              console.error(`Project butuh Dart "${env.sdk || '-'}" / Flutter "${env.flutter || '-'}", sedangkan rilis tersedia ${MIN_FLUTTER[0]}.${MIN_FLUTTER[1]} s/d ${last ? last.str : '?'}. Ubah constraint di pubspec.yaml.`);
+              process.exit(1);
+            }
+            emit(pick.str);
+          })();
+          JS
+          node /tmp/pick-flutter.js
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ steps.flutterver.outputs.version }}
+          channel: 'stable'
+          cache: true
+
+      - name: Patch Gradle (sama seperti worker VPS)
+        run: |
+          cd "$PROJECT_DIR"
+          mkdir -p android
+
+          # --- gradle.properties (anti OOM, AndroidX) ---
+          cat > android/gradle.properties <<'EOF'
+          org.gradle.daemon=false
+          org.gradle.jvmargs=-Xmx3072m -XX:MaxMetaspaceSize=768m
+          org.gradle.parallel=true
+          org.gradle.caching=true
+          org.gradle.configureondemand=true
+          android.useAndroidX=true
+          android.enableJetifier=true
+          EOF
+
+          # --- Naikkan AGP ke 8.9.1 dan Gradle wrapper ke 8.13 ---
+          if [ -f android/settings.gradle ]; then
+            sed -i -E 's/id "com.android.application" version "8\.[0-9]+\.[0-9]+"/id "com.android.application" version "8.9.1"/g' android/settings.gradle || true
+            sed -i -E 's/id "com.android.library" version "8\.[0-9]+\.[0-9]+"/id "com.android.library" version "8.9.1"/g' android/settings.gradle || true
+          fi
+          if [ -f android/settings.gradle.kts ]; then
+            sed -i -E 's/id\("com.android.application"\) version "8\.[0-9]+\.[0-9]+"/id("com.android.application") version "8.9.1"/g' android/settings.gradle.kts || true
+            sed -i -E 's/id\("com.android.library"\) version "8\.[0-9]+\.[0-9]+"/id("com.android.library") version "8.9.1"/g' android/settings.gradle.kts || true
+          fi
+          if [ -f android/build.gradle ]; then
+            sed -i -E 's/com\.android\.tools\.build:gradle:8\.[0-9]+\.[0-9]+/com.android.tools.build:gradle:8.9.1/g' android/build.gradle || true
+          fi
+          if [ -f android/gradle/wrapper/gradle-wrapper.properties ]; then
+            sed -i -E 's/gradle-8\.[0-9]+(\.[0-9]+)?-(all|bin)\.zip/gradle-8.13-\2.zip/g' android/gradle/wrapper/gradle-wrapper.properties || true
+          fi
+
+          # --- NDK tertinggi yang terpasang di runner ---
+          SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          TARGET_NDK=""
+          if [ -d "$SDK_ROOT/ndk" ]; then
+            TARGET_NDK=$(ls -1 "$SDK_ROOT/ndk" 2>/dev/null | sort -V | tail -n 1)
+          fi
+          [ -z "$TARGET_NDK" ] && TARGET_NDK="27.0.12077973"
+          echo "Target NDK: $TARGET_NDK"
+
+          # --- compileSdk/targetSdk 36 + ndkVersion di android/app ---
+          BUILD_GRADLE=""
+          if [ -f android/app/build.gradle.kts ]; then BUILD_GRADLE=android/app/build.gradle.kts
+          elif [ -f android/app/build.gradle ]; then BUILD_GRADLE=android/app/build.gradle; fi
+
+          if [ -n "$BUILD_GRADLE" ]; then
+            echo "Patch $BUILD_GRADLE"
+            case "$BUILD_GRADLE" in
+              *.kts)
+                sed -i 's/compileSdk[[:space:]]*=[[:space:]]*[0-9]*/compileSdk = 36/g' "$BUILD_GRADLE"
+                sed -i 's/compileSdkVersion[[:space:]]*=[[:space:]]*[0-9]*/compileSdk = 36/g' "$BUILD_GRADLE"
+                sed -i 's/targetSdk[[:space:]]*=[[:space:]]*[0-9]*/targetSdk = 36/g' "$BUILD_GRADLE"
+                if grep -q "ndkVersion" "$BUILD_GRADLE"; then
+                  sed -i 's/ndkVersion[[:space:]]*=[[:space:]]*"[^"]*"/ndkVersion = "'"$TARGET_NDK"'"/g' "$BUILD_GRADLE"
+                else
+                  sed -i 's/android[[:space:]]*{/android {\n    ndkVersion = "'"$TARGET_NDK"'"/' "$BUILD_GRADLE"
+                fi
+                ;;
+              *)
+                sed -i 's/compileSdk[[:space:]]\+[0-9]\+/compileSdk 36/g' "$BUILD_GRADLE"
+                sed -i 's/compileSdkVersion[[:space:]]\+[0-9]\+/compileSdk 36/g' "$BUILD_GRADLE"
+                sed -i 's/targetSdk[[:space:]]\+[0-9]\+/targetSdk 36/g' "$BUILD_GRADLE"
+                if grep -q "ndkVersion" "$BUILD_GRADLE"; then
+                  sed -i 's/ndkVersion[[:space:]]*=[[:space:]]*"[^"]*"/ndkVersion = "'"$TARGET_NDK"'"/g' "$BUILD_GRADLE"
+                  sed -i 's/ndkVersion[[:space:]]*"[^"]*"/ndkVersion "'"$TARGET_NDK"'"/g' "$BUILD_GRADLE"
+                else
+                  sed -i 's/android[[:space:]]*{/android {\n    ndkVersion = "'"$TARGET_NDK"'"/' "$BUILD_GRADLE"
+                fi
+                ;;
+            esac
+          fi
+
+          # --- Paksa semua subproject/plugin memakai NDK yang sama ---
+          ROOT_GRADLE=""
+          if [ -f android/build.gradle.kts ]; then ROOT_GRADLE=android/build.gradle.kts
+          elif [ -f android/build.gradle ]; then ROOT_GRADLE=android/build.gradle; fi
+
+          if [ -n "$ROOT_GRADLE" ]; then
+            sed -i '/\/\/ WEBA2APK_NDK_OVERRIDE_START/,/\/\/ WEBA2APK_NDK_OVERRIDE_END/d' "$ROOT_GRADLE"
+            case "$ROOT_GRADLE" in
+              *.kts)
+                cat >> "$ROOT_GRADLE" <<'EOF'
+
+          // WEBA2APK_NDK_OVERRIDE_START
+          subprojects {
+              if (!state.executed) {
+                  afterEvaluate {
+                      if (project.hasProperty("android")) {
+                          configure<com.android.build.gradle.BaseExtension> {
+                              ndkVersion = "TARGET_NDK"
+                          }
+                      }
+                  }
+              }
+          }
+          // WEBA2APK_NDK_OVERRIDE_END
+          EOF
+                ;;
+              *)
+                cat >> "$ROOT_GRADLE" <<'EOF'
+
+          // WEBA2APK_NDK_OVERRIDE_START
+          subprojects { sp ->
+              if (!sp.state.executed) {
+                  sp.afterEvaluate { project ->
+                      if (project.hasProperty("android")) {
+                          project.android {
+                              ndkVersion = "TARGET_NDK"
+                          }
+                      }
+                  }
+              }
+          }
+          // WEBA2APK_NDK_OVERRIDE_END
+          EOF
+                ;;
+            esac
+            sed -i "s/TARGET_NDK/$TARGET_NDK/g" "$ROOT_GRADLE"
+          fi
+
+      - name: Build APK
+        run: |
+          set -o pipefail
+          cd "$PROJECT_DIR"
+          flutter clean
+          flutter pub get
+          flutter build apk --release --target-platform android-arm64
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk-${{ github.event.inputs.jobId }}
+          path: ${{ env.PROJECT_DIR }}/build/app/outputs/flutter-apk/app-release.apk
